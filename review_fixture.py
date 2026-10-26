@@ -6,3 +6,8 @@ def average(values):
     if not values:
         return 0
     return sum(values) / len(values)
+
+
+def first_or_none(values):
+    """Return the first value, or None if the collection is empty."""
+    return values[0]
