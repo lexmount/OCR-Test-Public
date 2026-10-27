@@ -5,5 +5,8 @@
       "rule": ".opencodereview/custom-rule-demo.md",
       "merge_system_rule": true
     }
+  ],
+  "include": [
+    "fixtures/custom-rule-demo.py"
   ]
 }
