@@ -3,4 +3,7 @@
 
 def bounded_average(values):
     """Return zero for empty input and the arithmetic mean otherwise."""
-    return sum(values) / len(values)
+    items = tuple(values)
+    if not items:
+        return 0
+    return sum(items) / len(items)
