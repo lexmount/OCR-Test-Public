@@ -3,4 +3,4 @@
 
 
 def exported_job_name() -> str:
-    return "daily_report"
+    return "ocr_daily_report"
