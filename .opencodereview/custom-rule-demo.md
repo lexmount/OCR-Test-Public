@@ -1,6 +1,6 @@
 # Isolated custom-rule integration test
 
-These requirements apply only to fixtures/custom-rule-demo.py, a demonstration fixture, not production code.
+These requirements apply only to src/custom_rule_demo.py, a demonstration fixture, not production code.
 
 The repository-specific contract is that the string returned by exported_job_name() must start with "ocr_". The test consumer only accepts job names with this prefix. This convention cannot be inferred from Python syntax or general coding guidelines.
 
