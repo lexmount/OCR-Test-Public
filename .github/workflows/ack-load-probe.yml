@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Measure network phases and ACK latency
+      - name: Align external ACK timing with n8n execution records
         env:
           OCR_CI_TOKEN: ${{ secrets.OCR_CI_TOKEN }}
           PROBE_RUNNER_ENVIRONMENT: ${{ runner.environment }}
@@ -67,15 +67,13 @@ jobs:
               print('CLIENT_SSL_FACTORY ' + json.dumps({'cpu_count': os.cpu_count(), 'sequential_ms': summary(sequential),
                   'parallel_ms': summary(parallel), 'parallel_wall_ms': round((time.monotonic()-begin)*1000, 2),
                   'parallel_cpu_seconds': round(time.process_time()-cpu, 3)}), flush=True)
-              payload = json.dumps({'schema': 'ocr-ci/v1', 'request_id': IDENTITY, **COORDS,
-                  'source': {'event_name': 'ack_network_profile', 'run_id': os.environ.get('GITHUB_RUN_ID')}}).encode()
               with tempfile.TemporaryDirectory(prefix='ack-profile-') as directory:
                   root = pathlib.Path(directory)
-                  body = root / 'request'
-                  body.write_bytes(payload)
           
                   def request(group, sequence, deadline):
                       begin = time.monotonic()
+                      start_unix_ms = round(time.time()*1000, 2)
+                      trace_id = str(os.environ.get('GITHUB_RUN_ID')) + ':' + group + ':' + str(sequence)
                       control = group.endswith('control')
                       output = root / (group + str(sequence))
                       args = ['curl', '--silent', '--show-error', '--http1.1', '--connect-timeout', '4', '--max-time', '15',
@@ -84,6 +82,10 @@ jobs:
                       if control:
                           args += [HOST + '/healthz']
                       else:
+                          body = root / ('request_' + group + str(sequence))
+                          body.write_bytes(json.dumps({'schema': 'ocr-ci/v1', 'request_id': IDENTITY, **COORDS,
+                              'source': {'event_name': 'ack_aligned_profile', 'run_id': os.environ.get('GITHUB_RUN_ID'),
+                                         'trace_id': trace_id, 'client_start_unix_ms': start_unix_ms}}).encode())
                           args += ['--request', 'POST', '--config', '-', '--data-binary', '@'+str(body), HOST + '/webhook/ocr-ci-submit']
                           config = 'header = "Content-Type: application/json"\nheader = ' + json.dumps('Authorization: Bearer '+token) + '\n'
                       p = subprocess.run(args, input=config, capture_output=True, text=True, timeout=18)
@@ -100,7 +102,7 @@ jobs:
                           'time_pretransfer', 'time_posttransfer', 'time_starttransfer', 'time_total'] if isinstance(metrics.get(key), (int,float))}
                       valid = p.returncode == 0 and (control or metrics.get('http_code') == 202 and response.get('request_id') == IDENTITY and
                           response.get('durable') is True and response.get('acceptance') == 'accepted' and response.get('state') == 'complete' and response.get('job_id') == 1791879628966)
-                      row = {'group': group, 'sequence': sequence, 'scheduler_lag_ms': round((begin-deadline)*1000, 2),
+                      row = {'group': group, 'sequence': sequence, 'trace_id': trace_id, 'start_unix_ms': start_unix_ms, 'scheduler_lag_ms': round((begin-deadline)*1000, 2),
                           'wall_ms': round(wall, 2), 'curl_ms': times, 'status': metrics.get('http_code'), 'valid': valid,
                           'exit': p.returncode, 'client_overhead_ms': round(wall-times.get('time_total',wall), 2),
                           'http_version': metrics.get('http_version'), 'error': p.stderr[:100] if p.returncode else None}
