@@ -12,161 +12,129 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Measure CI ACK from GitHub-hosted public network
+      - name: Measure network phases and ACK latency
         env:
           OCR_CI_TOKEN: ${{ secrets.OCR_CI_TOKEN }}
           PROBE_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         shell: python3 {0}
         run: |
           # SPDX-License-Identifier: Apache-2.0
-          import collections
           import concurrent.futures
           import hashlib
           import ipaddress
           import json
-          import math
           import os
+          import pathlib
           import socket
+          import ssl
           import statistics
-          import threading
+          import subprocess
+          import tempfile
           import time
-          import urllib.error
-          import urllib.request
           
-          ENDPOINT = 'https://n8n.cross.lexmount.cn/webhook/ocr-ci-submit'
-          RATE = 50
-          DURATION = 5
-          COUNT = RATE * DURATION
-          MAX_INFLIGHT = 100
-          TIMEOUT = 15
-          COORDINATES = {
-              'repository': 'lexmount/ocr-test-public',
-              'pull_number': 19,
-              'head_sha': '1a16bbbb7e765033df72fb7c8ceacdce70d6e9cc',
-              'base_sha': '01ebeab57d581e0c94b47802e9fb9bbfed937417',
-              'base_ref': 'main',
-          }
-          REQUEST_ID = 'ocr-ci-' + hashlib.sha256(json.dumps(
-              COORDINATES, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+          HOST = 'https://n8n.cross.lexmount.cn'
+          COORDS = {'repository': 'lexmount/ocr-test-public', 'pull_number': 19,
+                    'head_sha': '1a16bbbb7e765033df72fb7c8ceacdce70d6e9cc',
+                    'base_sha': '01ebeab57d581e0c94b47802e9fb9bbfed937417', 'base_ref': 'main'}
+          IDENTITY = 'ocr-ci-' + hashlib.sha256(json.dumps(COORDS, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
           
           
-          class NoRedirect(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, req, fp, code, msg, headers, newurl):
-                  return None
-          
-          
-          def percentile(values, fraction):
-              return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)] if values else None
+          def summary(values):
+              values = sorted(values)
+              return {'mean': round(statistics.mean(values), 2), 'p50': values[(len(values)-1)//2],
+                      'p95': values[min(len(values)-1, int(len(values)*.95))], 'max': values[-1]} if values else None
           
           
           def main():
-              if os.environ.get('PROBE_RUNNER_ENVIRONMENT') != 'github-hosted':
-                  raise RuntimeError('This probe requires a GitHub-hosted runner')
-              if os.environ.get('GITHUB_REPOSITORY', '').lower() != 'lexmount/ocr-test-public':
-                  raise RuntimeError('This probe is limited to the designated test repository')
+              if os.environ.get('PROBE_RUNNER_ENVIRONMENT') != 'github-hosted' or os.environ.get('GITHUB_REPOSITORY', '').lower() != 'lexmount/ocr-test-public':
+                  raise RuntimeError('An external GitHub-hosted test-repository runner is required')
               token = os.environ.get('OCR_CI_TOKEN', '').strip()
               if not token:
-                  raise RuntimeError('The existing OCR_CI_TOKEN secret is unavailable; no requests sent')
-              addresses = sorted({x[4][0] for x in socket.getaddrinfo('n8n.cross.lexmount.cn', 443)})
-              if not addresses or not all(ipaddress.ip_address(value).is_global for value in addresses):
-                  raise RuntimeError('The target did not resolve exclusively to public addresses')
-              payload = json.dumps({'schema': 'ocr-ci/v1', 'request_id': REQUEST_ID,
-                                    **COORDINATES, 'source': {'event_name': 'ack_load_probe',
-                                    'run_id': os.environ.get('GITHUB_RUN_ID')}}).encode()
-              started = time.monotonic()
-              semaphore = threading.BoundedSemaphore(MAX_INFLIGHT)
-              stop = threading.Event()
-              lock = threading.Lock()
-              reasons = []
+                  raise RuntimeError('Existing CI secret unavailable')
+              addresses = {x[4][0] for x in socket.getaddrinfo('n8n.cross.lexmount.cn', 443)}
+              if not all(ipaddress.ip_address(x).is_global for x in addresses):
+                  raise RuntimeError('Public target required')
           
-              def stop_sending(reason):
-                  with lock:
-                      if reason not in reasons:
-                          reasons.append(reason)
-                  stop.set()
-          
-              def request(sequence, schedule):
+              def context_cost(_):
                   begin = time.monotonic()
-                  status, acknowledged, error = None, False, None
-                  try:
-                      req = urllib.request.Request(ENDPOINT, data=payload, method='POST', headers={
-                          'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token,
-                          'User-Agent': 'ocr-ack-load-probe/1.0'})
-                      with urllib.request.build_opener(NoRedirect).open(req, timeout=TIMEOUT) as response:
-                          status = response.status
-                          raw = response.read(65537)
-                          if len(raw) > 65536:
-                              raise ValueError('Oversized response')
-                          body = json.loads(raw)
-                      acknowledged = (status == 202 and body.get('schema') == 'ocr-ci/v1' and
-                          body.get('request_id') == REQUEST_ID and body.get('contract_version') == 2 and
-                          body.get('acceptance') == 'accepted' and body.get('scheduler') == 'backend' and
-                          body.get('durable') is True and body.get('task_id') == REQUEST_ID and
-                          body.get('state') == 'complete' and body.get('job_id') == 1791879628966 and
-                          all(body.get(key) == value for key, value in COORDINATES.items()))
-                      if not acknowledged:
-                          error = 'InvalidACK'
-                  except urllib.error.HTTPError as exc:
-                      status, error = exc.code, 'HTTPError'
-                      exc.close()
-                  except Exception as exc:
-                      error = type(exc).__name__
-                  elapsed = (time.monotonic() - begin) * 1000
-                  if sequence >= 0:
-                      semaphore.release()
-                      if not acknowledged:
-                          stop_sending('ack_failure')
-                      elif elapsed > 3000:
-                          stop_sending('response_over_3_seconds')
-                  return {'sequence': sequence, 'start_offset_ms': round((begin - started) * 1000, 2),
-                          'scheduler_lag_ms': round((begin - schedule) * 1000, 2),
-                          'elapsed_ms': round(elapsed, 2), 'status': status, 'ack': acknowledged, 'error': error}
+                  context = ssl.create_default_context()
+                  return (time.monotonic() - begin) * 1000
           
-              baseline = request(-1, time.monotonic())
-              print('ACK_BASELINE ' + json.dumps(baseline), flush=True)
-              if not baseline['ack'] or baseline['elapsed_ms'] > 3000:
-                  raise RuntimeError('Baseline is not healthy enough for a shared-ingress load test; no burst sent')
-              futures = []
-              with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_INFLIGHT) as pool:
-                  started = time.monotonic() + 0.2
-                  for sequence in range(COUNT):
-                      schedule = started + sequence / RATE
-                      if stop.wait(max(0, schedule - time.monotonic())):
-                          break
-                      if not semaphore.acquire(blocking=False):
-                          stop_sending('inflight_limit')
-                          break
-                      futures.append(pool.submit(request, sequence, schedule))
-                  rows = [future.result() for future in concurrent.futures.as_completed(futures)]
-              rows.sort(key=lambda row: row['sequence'])
-              values = [row['elapsed_ms'] for row in rows]
-              starts = [row['start_offset_ms'] / 1000 for row in rows]
-              arrival_span = max(starts) - min(starts) + 1 / RATE if starts else 0
-              summary = {'target_qps': RATE, 'target_seconds': DURATION, 'planned_requests': COUNT,
-                  'sent_requests': len(rows), 'acknowledged': sum(row['ack'] for row in rows),
-                  'failed': sum(not row['ack'] for row in rows), 'actual_arrival_qps': round(len(rows) / arrival_span, 2) if arrival_span else 0,
-                  'starts_per_second': dict(collections.Counter(int(max(0, row['start_offset_ms']) / 1000) for row in rows)),
-                  'latency_ms': {'mean': round(statistics.mean(values), 2) if values else None,
-                                 'p50': percentile(values, .5), 'p95': percentile(values, .95),
-                                 'p99': percentile(values, .99), 'max': max(values) if values else None},
-                  'status_counts': dict(collections.Counter(str(row['status']) for row in rows)),
-                  'max_scheduler_lag_ms': max((row['scheduler_lag_ms'] for row in rows), default=0),
-                  'stop_reasons': reasons, 'runner_environment': os.environ['PROBE_RUNNER_ENVIRONMENT'],
-                  'runner_name': os.environ.get('RUNNER_NAME'), 'public_target_addresses': addresses,
-                  'replay_only': True, 'repository': COORDINATES['repository'], 'pull_number': 19,
-                  'request_id': REQUEST_ID, 'baseline_request_additional': True, 'automatic_retries': False}
-              for row in rows:
-                  print('ACK_SAMPLE ' + json.dumps(row), flush=True)
-              print('ACK_SUMMARY ' + json.dumps(summary), flush=True)
-              summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
-              if summary_file:
-                  with open(summary_file, 'a') as stream:
-                      stream.write('## ACK load measurement\n\nExisting completed receipt replays only. ')
-                      stream.write('A completed measurement does not certify new-task admission capacity.\n\n```json\n')
-                      stream.write(json.dumps(summary, indent=2) + '\n```\n')
-              if summary['failed'] or summary['stop_reasons'] or len(rows) != COUNT:
-                  raise RuntimeError('Load test stopped or recorded failed ACKs; inspect the published measurements')
+              sequential = [context_cost(i) for i in range(5)]
+              begin, cpu = time.monotonic(), time.process_time()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+                  parallel = list(pool.map(context_cost, range(32)))
+              print('CLIENT_SSL_FACTORY ' + json.dumps({'cpu_count': os.cpu_count(), 'sequential_ms': summary(sequential),
+                  'parallel_ms': summary(parallel), 'parallel_wall_ms': round((time.monotonic()-begin)*1000, 2),
+                  'parallel_cpu_seconds': round(time.process_time()-cpu, 3)}), flush=True)
+              payload = json.dumps({'schema': 'ocr-ci/v1', 'request_id': IDENTITY, **COORDS,
+                  'source': {'event_name': 'ack_network_profile', 'run_id': os.environ.get('GITHUB_RUN_ID')}}).encode()
+              with tempfile.TemporaryDirectory(prefix='ack-profile-') as directory:
+                  root = pathlib.Path(directory)
+                  body = root / 'request'
+                  body.write_bytes(payload)
+          
+                  def request(group, sequence, deadline):
+                      begin = time.monotonic()
+                      control = group.endswith('control')
+                      output = root / (group + str(sequence))
+                      args = ['curl', '--silent', '--show-error', '--http1.1', '--connect-timeout', '4', '--max-time', '15',
+                              '--output', str(output), '--write-out', '%{json}']
+                      config = ''
+                      if control:
+                          args += [HOST + '/healthz']
+                      else:
+                          args += ['--request', 'POST', '--config', '-', '--data-binary', '@'+str(body), HOST + '/webhook/ocr-ci-submit']
+                          config = 'header = "Content-Type: application/json"\nheader = ' + json.dumps('Authorization: Bearer '+token) + '\n'
+                      p = subprocess.run(args, input=config, capture_output=True, text=True, timeout=18)
+                      wall = (time.monotonic()-begin)*1000
+                      try:
+                          metrics = json.loads(p.stdout)
+                      except Exception:
+                          metrics = {}
+                      try:
+                          response = json.loads(output.read_text())
+                      except Exception:
+                          response = {}
+                      times = {key: round(metrics[key]*1000, 2) for key in ['time_namelookup', 'time_connect', 'time_appconnect',
+                          'time_pretransfer', 'time_posttransfer', 'time_starttransfer', 'time_total'] if isinstance(metrics.get(key), (int,float))}
+                      valid = p.returncode == 0 and (control or metrics.get('http_code') == 202 and response.get('request_id') == IDENTITY and
+                          response.get('durable') is True and response.get('acceptance') == 'accepted' and response.get('state') == 'complete' and response.get('job_id') == 1791879628966)
+                      row = {'group': group, 'sequence': sequence, 'scheduler_lag_ms': round((begin-deadline)*1000, 2),
+                          'wall_ms': round(wall, 2), 'curl_ms': times, 'status': metrics.get('http_code'), 'valid': valid,
+                          'exit': p.returncode, 'client_overhead_ms': round(wall-times.get('time_total',wall), 2),
+                          'http_version': metrics.get('http_version'), 'error': p.stderr[:100] if p.returncode else None}
+                      print('PHASE_SAMPLE '+json.dumps(row), flush=True)
+                      return row
+          
+                  rows = []
+                  for sequence in range(3):
+                      rows.append(request('baseline_ci', sequence, time.monotonic()))
+                      rows.append(request('baseline_control', sequence, time.monotonic()))
+                  if not all(r['valid'] for r in rows):
+                      raise RuntimeError('Baseline failed; no burst sent')
+                  started = time.monotonic()+.2
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=53) as pool:
+                      futures = []
+                      for sequence in range(50):
+                          deadline = started+sequence/50
+                          time.sleep(max(0,deadline-time.monotonic()))
+                          futures.append(pool.submit(request,'burst_ci',sequence,deadline))
+                          if sequence in [0,20,40]:
+                              futures.append(pool.submit(request,'burst_control',sequence,deadline))
+                      rows += [f.result() for f in concurrent.futures.as_completed(futures)]
+                  groups = {}
+                  for group in ['baseline_ci','baseline_control','burst_ci','burst_control']:
+                      selected = [r for r in rows if r['group']==group]
+                      groups[group] = {'n':len(selected),'valid':sum(r['valid'] for r in selected),'wall_ms':summary([r['wall_ms'] for r in selected]),
+                          'client_overhead_ms':summary([r['client_overhead_ms'] for r in selected]),
+                          'phases_ms':{key:summary([r['curl_ms'][key] for r in selected if key in r['curl_ms']]) for key in ['time_namelookup','time_connect','time_appconnect','time_pretransfer','time_posttransfer','time_starttransfer','time_total']}}
+                  print('PHASE_SUMMARY '+json.dumps({'groups':groups,'public_addresses':sorted(addresses),'runner':os.environ.get('RUNNER_NAME'),
+                      'runner_environment':os.environ['PROBE_RUNNER_ENVIRONMENT'],'replay_only':True,'ci_burst_requests':50,'target_ci_qps':50}),flush=True)
+                  if not all(r['valid'] for r in rows):
+                      raise RuntimeError('Some diagnostic requests did not complete successfully')
           
           
           if __name__ == '__main__':
               main()
+          
