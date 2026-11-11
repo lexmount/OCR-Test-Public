@@ -1,0 +1,172 @@
+name: Temporary ACK load probe
+on:
+  push:
+    branches:
+      - 'test/ack-load-20261111-mwc6n9ve'
+permissions: {}
+concurrency:
+  group: temporary-ocr-ack-load-probe
+  cancel-in-progress: false
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Measure CI ACK from GitHub-hosted public network
+        env:
+          OCR_CI_TOKEN: ${{ secrets.OCR_CI_TOKEN }}
+          PROBE_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        shell: python3 {0}
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          import collections
+          import concurrent.futures
+          import hashlib
+          import ipaddress
+          import json
+          import math
+          import os
+          import socket
+          import statistics
+          import threading
+          import time
+          import urllib.error
+          import urllib.request
+          
+          ENDPOINT = 'https://n8n.cross.lexmount.cn/webhook/ocr-ci-submit'
+          RATE = 50
+          DURATION = 5
+          COUNT = RATE * DURATION
+          MAX_INFLIGHT = 100
+          TIMEOUT = 15
+          COORDINATES = {
+              'repository': 'lexmount/ocr-test-public',
+              'pull_number': 19,
+              'head_sha': '1a16bbbb7e765033df72fb7c8ceacdce70d6e9cc',
+              'base_sha': '01ebeab57d581e0c94b47802e9fb9bbfed937417',
+              'base_ref': 'main',
+          }
+          REQUEST_ID = 'ocr-ci-' + hashlib.sha256(json.dumps(
+              COORDINATES, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          
+          def percentile(values, fraction):
+              return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)] if values else None
+          
+          
+          def main():
+              if os.environ.get('PROBE_RUNNER_ENVIRONMENT') != 'github-hosted':
+                  raise RuntimeError('This probe requires a GitHub-hosted runner')
+              if os.environ.get('GITHUB_REPOSITORY', '').lower() != 'lexmount/ocr-test-public':
+                  raise RuntimeError('This probe is limited to the designated test repository')
+              token = os.environ.get('OCR_CI_TOKEN', '').strip()
+              if not token:
+                  raise RuntimeError('The existing OCR_CI_TOKEN secret is unavailable; no requests sent')
+              addresses = sorted({x[4][0] for x in socket.getaddrinfo('n8n.cross.lexmount.cn', 443)})
+              if not addresses or not all(ipaddress.ip_address(value).is_global for value in addresses):
+                  raise RuntimeError('The target did not resolve exclusively to public addresses')
+              payload = json.dumps({'schema': 'ocr-ci/v1', 'request_id': REQUEST_ID,
+                                    **COORDINATES, 'source': {'event_name': 'ack_load_probe',
+                                    'run_id': os.environ.get('GITHUB_RUN_ID')}}).encode()
+              started = time.monotonic()
+              semaphore = threading.BoundedSemaphore(MAX_INFLIGHT)
+              stop = threading.Event()
+              lock = threading.Lock()
+              reasons = []
+          
+              def stop_sending(reason):
+                  with lock:
+                      if reason not in reasons:
+                          reasons.append(reason)
+                  stop.set()
+          
+              def request(sequence, schedule):
+                  begin = time.monotonic()
+                  status, acknowledged, error = None, False, None
+                  try:
+                      req = urllib.request.Request(ENDPOINT, data=payload, method='POST', headers={
+                          'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token,
+                          'User-Agent': 'ocr-ack-load-probe/1.0'})
+                      with urllib.request.build_opener(NoRedirect).open(req, timeout=TIMEOUT) as response:
+                          status = response.status
+                          raw = response.read(65537)
+                          if len(raw) > 65536:
+                              raise ValueError('Oversized response')
+                          body = json.loads(raw)
+                      acknowledged = (status == 202 and body.get('schema') == 'ocr-ci/v1' and
+                          body.get('request_id') == REQUEST_ID and body.get('contract_version') == 2 and
+                          body.get('acceptance') == 'accepted' and body.get('scheduler') == 'backend' and
+                          body.get('durable') is True and body.get('task_id') == REQUEST_ID and
+                          body.get('state') == 'complete' and body.get('job_id') == 1791879628966 and
+                          all(body.get(key) == value for key, value in COORDINATES.items()))
+                      if not acknowledged:
+                          error = 'InvalidACK'
+                  except urllib.error.HTTPError as exc:
+                      status, error = exc.code, 'HTTPError'
+                      exc.close()
+                  except Exception as exc:
+                      error = type(exc).__name__
+                  elapsed = (time.monotonic() - begin) * 1000
+                  if sequence >= 0:
+                      semaphore.release()
+                      if not acknowledged:
+                          stop_sending('ack_failure')
+                      elif elapsed > 3000:
+                          stop_sending('response_over_3_seconds')
+                  return {'sequence': sequence, 'start_offset_ms': round((begin - started) * 1000, 2),
+                          'scheduler_lag_ms': round((begin - schedule) * 1000, 2),
+                          'elapsed_ms': round(elapsed, 2), 'status': status, 'ack': acknowledged, 'error': error}
+          
+              baseline = request(-1, time.monotonic())
+              print('ACK_BASELINE ' + json.dumps(baseline), flush=True)
+              if not baseline['ack'] or baseline['elapsed_ms'] > 3000:
+                  raise RuntimeError('Baseline is not healthy enough for a shared-ingress load test; no burst sent')
+              futures = []
+              with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_INFLIGHT) as pool:
+                  started = time.monotonic() + 0.2
+                  for sequence in range(COUNT):
+                      schedule = started + sequence / RATE
+                      if stop.wait(max(0, schedule - time.monotonic())):
+                          break
+                      if not semaphore.acquire(blocking=False):
+                          stop_sending('inflight_limit')
+                          break
+                      futures.append(pool.submit(request, sequence, schedule))
+                  rows = [future.result() for future in concurrent.futures.as_completed(futures)]
+              rows.sort(key=lambda row: row['sequence'])
+              values = [row['elapsed_ms'] for row in rows]
+              starts = [row['start_offset_ms'] / 1000 for row in rows]
+              arrival_span = max(starts) - min(starts) + 1 / RATE if starts else 0
+              summary = {'target_qps': RATE, 'target_seconds': DURATION, 'planned_requests': COUNT,
+                  'sent_requests': len(rows), 'acknowledged': sum(row['ack'] for row in rows),
+                  'failed': sum(not row['ack'] for row in rows), 'actual_arrival_qps': round(len(rows) / arrival_span, 2) if arrival_span else 0,
+                  'starts_per_second': dict(collections.Counter(int(max(0, row['start_offset_ms']) / 1000) for row in rows)),
+                  'latency_ms': {'mean': round(statistics.mean(values), 2) if values else None,
+                                 'p50': percentile(values, .5), 'p95': percentile(values, .95),
+                                 'p99': percentile(values, .99), 'max': max(values) if values else None},
+                  'status_counts': dict(collections.Counter(str(row['status']) for row in rows)),
+                  'max_scheduler_lag_ms': max((row['scheduler_lag_ms'] for row in rows), default=0),
+                  'stop_reasons': reasons, 'runner_environment': os.environ['PROBE_RUNNER_ENVIRONMENT'],
+                  'runner_name': os.environ.get('RUNNER_NAME'), 'public_target_addresses': addresses,
+                  'replay_only': True, 'repository': COORDINATES['repository'], 'pull_number': 19,
+                  'request_id': REQUEST_ID, 'baseline_request_additional': True, 'automatic_retries': False}
+              for row in rows:
+                  print('ACK_SAMPLE ' + json.dumps(row), flush=True)
+              print('ACK_SUMMARY ' + json.dumps(summary), flush=True)
+              summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary_file:
+                  with open(summary_file, 'a') as stream:
+                      stream.write('## ACK load measurement\n\nExisting completed receipt replays only. ')
+                      stream.write('A completed measurement does not certify new-task admission capacity.\n\n```json\n')
+                      stream.write(json.dumps(summary, indent=2) + '\n```\n')
+              if summary['failed'] or summary['stop_reasons'] or len(rows) != COUNT:
+                  raise RuntimeError('Load test stopped or recorded failed ACKs; inspect the published measurements')
+          
+          
+          if __name__ == '__main__':
+              main()
