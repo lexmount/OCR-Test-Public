@@ -19,3 +19,9 @@ Use small pull requests to verify review dispatch, review comments, and the fina
 - This repository contains test material only.
 - Do not commit credentials, tokens, or private company code.
 - This initial README does not configure a webhook, workflow, or merge requirement.
+
+## Unified review rollout probe: snapshot
+
+This branch adds a small offline review-progress calculation fixture.
+Run `python3 -m unittest discover -s tests -p 'test_*.py'`.
+This pull request is test material and must not be merged.
