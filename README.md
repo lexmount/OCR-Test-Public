@@ -25,3 +25,5 @@ Use small pull requests to verify review dispatch, review comments, and the fina
 This branch adds a small offline review-progress calculation fixture.
 Run `python3 -m unittest discover -s tests -p 'test_*.py'`.
 This pull request is test material and must not be merged.
+
+A second cancellation attempt uses a fresh commit so acceptance can be observed before closing.
