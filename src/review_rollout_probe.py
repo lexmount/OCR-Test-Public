@@ -8,4 +8,4 @@ def completed_ratio(completed: int, total: int) -> float:
     """
     if total < 0 or completed < 0 or completed > total:
         raise ValueError("invalid review counts")
-    return completed // total if total else 1.0
+    return completed / total if total else 1.0
