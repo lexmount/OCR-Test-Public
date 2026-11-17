@@ -2,4 +2,4 @@
 
 
 def exported_job_name() -> str:
-    return "linked_worktree_probe"
+    return "ocr_linked_worktree_probe"
