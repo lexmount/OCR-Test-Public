@@ -1,7 +1,7 @@
 """Small offline fixture for the production worktree acceptance review."""
 
 
-def batch_ranges(total: int, batch_size: int = 20) -> list[tuple[int, int]]:
+def batch_ranges(total: int, batch_size: int = 8) -> list[tuple[int, int]]:
     """Return non-overlapping half-open ranges covering exactly total items."""
     if type(total) is not int or total < 0:
         raise ValueError("total must be a non-negative integer")
