@@ -3,4 +3,4 @@
 
 def sample_coordinates() -> tuple[int, int]:
     """Return the two coordinates for the test fixture."""
-    return (2, 5)
+    return (2, 6)

@@ -5,4 +5,4 @@ from src.ocr54_snapshot import sample_coordinates
 
 class CoordinateTests(unittest.TestCase):
     def test_sample_coordinates(self):
-        self.assertEqual(sample_coordinates(), (2, 5))
+        self.assertEqual(sample_coordinates(), (2, 6))
