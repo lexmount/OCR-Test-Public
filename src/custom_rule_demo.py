@@ -2,4 +2,4 @@
 
 
 def exported_job_name() -> str:
-    return "ocr_linked_worktree_probe"
+    return "lexmount-ocr54-prefix-probe"
